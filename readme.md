@@ -77,18 +77,11 @@ The server exposes a WebSocket endpoint that LaserGRBL can connect to using its 
 6. Enter the WebSocket URL displayed by the server (e.g., `ws://192.168.1.100:8765`)
 7. Connect normally and use LaserGRBL as you would with a direct connection
 
-## Streaming Modes
-
-LaserGRBL provides different streaming modes when using WebSocket connections:
-- **Buffered**: Optimizes command streaming, filling up the GRBL receive buffer (recommended)
-- **Synchronous**: Waits for the execution of each command prior to sending the next (safer but slower)
-- **RepeatOnError**: Same as Synchronous but repeats commands if errors are detected
-
 ## Limitations
 
-- Allows only one connected client at a time
-- No authentication implemented (anyone on your network can connect)
-- No graceful shutdown mechanism (use Ctrl+C to stop the server)
+- Allows only one connected client at a time (exclusive access to the GRBL device)
+- No support for multiple GRBL devices (one server per device, you can run multiple servers on different ports)
+- No authentication implemented (anyone on your local network can connect to the server)
 
 ## Troubleshooting
 
