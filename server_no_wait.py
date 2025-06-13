@@ -5,13 +5,11 @@ import sys
 import platform
 import socket
 
+
 state = {
     "active_client": None,
-    "serial_port": None,
-    "command_queue": asyncio.Queue(),
-    "waiting_ok": asyncio.Event()
+    "serial_port": None
 }
-state["waiting_ok"].set()  # Initially ready to send
 
 CONFIG = {
     "port": None,
@@ -35,35 +33,42 @@ def get_local_ip():
 async def handle_websocket(websocket):
     if state["active_client"] is not None:
         await websocket.close(1000, "Server is busy with another client")
-        print("Connection rejected: server already has an active client")
+        print(f"Connection rejected: server already has an active client")
         return
-
+    
     state["active_client"] = websocket
-    print("New client connected")
-
+    print(f"New client connected")
+    
     try:
         async for message in websocket:
             if not state["serial_port"] or not state["serial_port"].is_open:
                 await try_open_serial()
-
+                
             if not state["serial_port"] or not state["serial_port"].is_open:
                 try:
                     await websocket.send(b'{"error": "Serial port not connected"}')
                 except:
                     pass
                 continue
-
+                
             if isinstance(message, str):
                 message = message.encode('utf-8')
-
-            await state["command_queue"].put(message)
-
+            
+            try:
+                state["serial_port"].write(message)
+                
+                if message.endswith(b'\n'):
+                    print(f"-> GRBL: {message.decode('utf-8', errors='replace').strip()}")
+            except Exception as e:
+                print(f"Error writing to serial: {e}")
+                close_serial()
+                
     except Exception as e:
         print(f"Websocket error: {e}")
     finally:
         if state["active_client"] == websocket:
             state["active_client"] = None
-        print("Client disconnected")
+        print(f"Client disconnected")
 
 def close_serial():
     if state["serial_port"]:
@@ -77,12 +82,12 @@ def close_serial():
 
 async def try_open_serial():
     if state["serial_port"] and state["serial_port"].is_open:
-        return True
-
+        return True 
+        
     try:
         state["serial_port"] = serial.Serial(
-            CONFIG["port"],
-            CONFIG["baud_rate"],
+            CONFIG["port"], 
+            CONFIG["baud_rate"], 
             timeout=CONFIG["timeout"]
         )
         print(f"Opened serial port: {CONFIG['port']}")
@@ -92,30 +97,15 @@ async def try_open_serial():
         state["serial_port"] = None
         return False
 
-async def serial_writer():
-    while True:
-        await state["waiting_ok"].wait()
-        command = await state["command_queue"].get()
-        if state["serial_port"] and state["serial_port"].is_open:
-            try:
-                state["serial_port"].write(command)
-                if command.endswith(b'\n'):
-                    print(f"-> GRBL: {command.decode('utf-8', errors='replace').strip()}")
-                state["waiting_ok"].clear()
-            except Exception as e:
-                print(f"Error writing to serial: {e}")
-                close_serial()
-        await asyncio.sleep(0.001)
-
 async def read_from_serial():
     while True:
         if not state["serial_port"] or not state["serial_port"].is_open:
             if await try_open_serial():
-                print("Serial port reconnected")
+                print(f"Serial port reconnected")
             else:
                 await asyncio.sleep(RETRY_INTERVAL)
                 continue
-
+                
         try:
             if state["serial_port"].in_waiting > 0:
                 data = state["serial_port"].readline()
@@ -123,9 +113,7 @@ async def read_from_serial():
                     message = data.decode('utf-8', errors='replace').strip()
                     if message:
                         print(f"<- GRBL: {message}")
-                        if "ok" in message.lower():
-                            state["waiting_ok"].set()
-
+                        
                         if state["active_client"]:
                             try:
                                 await state["active_client"].send(data)
@@ -135,7 +123,7 @@ async def read_from_serial():
         except Exception as e:
             print(f"Error reading from serial: {e}")
             close_serial()
-
+            
         await asyncio.sleep(0.01)
 
 async def serial_watchdog():
@@ -155,29 +143,34 @@ async def main():
 
     system = platform.system()
     if system == "Windows":
-        CONFIG["port"] = "COM" + sys.argv[1] if sys.argv[1].isdigit() else sys.argv[1]
+        if sys.argv[1].isdigit():
+            CONFIG["port"] = "COM" + sys.argv[1]
+        else:
+            CONFIG["port"] = sys.argv[1]
     else:
-        CONFIG["port"] = sys.argv[1] if sys.argv[1].startswith('/dev/') else "/dev/tty" + sys.argv[1]
-
+        if sys.argv[1].startswith('/dev/'):
+            CONFIG["port"] = sys.argv[1]
+        else:
+            CONFIG["port"] = "/dev/tty" + sys.argv[1]
+    
     CONFIG["ws_port"] = int(sys.argv[2])
-
+    
     print(f"Operating System: {system}")
     print(f"Using serial port: {CONFIG['port']}")
-
+    
     local_ip = get_local_ip()
-
+    
     try:
         await try_open_serial()
-
+        
         async with websockets.serve(handle_websocket, "0.0.0.0", CONFIG["ws_port"]):
             print(f"URL: ws://{local_ip}:{CONFIG['ws_port']}")
-
+            
             serial_reader = asyncio.create_task(read_from_serial())
-            serial_writer_task = asyncio.create_task(serial_writer())
             watchdog = asyncio.create_task(serial_watchdog())
-
+            
             await asyncio.Future()
-
+    
     except Exception as e:
         print(f"Server error: {e}")
     finally:
