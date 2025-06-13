@@ -1,129 +1,217 @@
+
 import asyncio
-import websockets
-import serial
-import sys
+import collections
 import platform
 import socket
+import sys
+from contextlib import suppress
+from typing import Deque, Optional
 
-state = {
-    "active_client": None,
-    "serial_port": None,
-    "command_queue": asyncio.Queue(),
-    "waiting_for_ok": asyncio.Event()
-}
+import serial
+import websockets
 
-CONFIG = {
-    "port": None,
-    "baud_rate": 115200,
-    "timeout": 0.1,
-    "ws_port": None
-}
+# ---------- Configuración por defecto ----------
+GRBL_BUFFER_BYTES = 128          # búfer interno de GRBL
+SAFETY_MARGIN = 4                # deja 4 bytes libres
+MAX_PENDING = GRBL_BUFFER_BYTES - SAFETY_MARGIN
+BAUDRATE = 115_200
+SERIAL_TIMEOUT = 0               # lectura no bloqueante
+RETRY_INTERVAL = 5               # s para reintentar el puerto serie
+PING_SECONDS = 20                # keep-alive WebSocket
+# ------------------------------------------------
 
-RETRY_INTERVAL = 5
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
+class Bridge:
+    """Mantiene el enlace WebSocket ⇆ GRBL con control de flujo."""
 
-async def handle_websocket(websocket):
-    if state["active_client"]:
-        await websocket.close(1000, "Server busy")
-        return
+    def __init__(self, port: str, ws_port: int):
+        self.port_name = port
+        self.ws_port = ws_port
+        self.serial: Optional[serial.Serial] = None
+        self.client: Optional[websockets.WebSocketServerProtocol] = None
+        self.pending: Deque[int] = collections.deque()   # bytes aún no confirmados
+        self.recv_buf = bytearray()                      # ensamblador de líneas RX
 
-    state["active_client"] = websocket
-    print("Client connected")
+    # ---------- utilidades de red ----------
+    @staticmethod
+    def local_ip() -> str:
+        """Devuelve la IP local más probable (no 127.0.0.1)."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except Exception:
+            return "127.0.0.1"
 
-    try:
-        async for message in websocket:
-            if isinstance(message, str):
-                message = message.encode('utf-8')
+    # ---------- Serial ----------
+    async def ensure_serial(self) -> bool:
+        """Abre el puerto si está cerrado. Devuelve True en caso de éxito."""
+        if self.serial and self.serial.is_open:
+            return True
 
-            # Add command to the queue
-            await state["command_queue"].put(message)
-    except:
-        pass
-    finally:
-        print("Client disconnected")
-        state["active_client"] = None
+        with suppress(Exception):
+            if self.serial:
+                self.serial.close()
 
-async def serial_writer():
-    while True:
-        cmd = await state["command_queue"].get()
+        try:
+            self.serial = serial.Serial(
+                self.port_name,
+                BAUDRATE,
+                timeout=SERIAL_TIMEOUT,
+                write_timeout=0,
+            )
+            self.serial.reset_input_buffer()
+            print(f"[SERIAL] Abierto {self.port_name}")
+            return True
+        except Exception as e:
+            print(f"[SERIAL] No se pudo abrir {self.port_name}: {e}")
+            self.serial = None
+            return False
 
-        if state["serial_port"] and state["serial_port"].is_open:
+    def serial_write(self, line: bytes) -> None:
+        """Envía una línea a GRBL respetando la ventana de flujo."""
+        self.serial.write(line)
+        self.pending.append(len(line))
+
+    # ---------- WebSocket handler ----------
+    async def ws_handler(self, websocket: websockets.WebSocketServerProtocol) -> None:
+        """Gestiona un cliente WebSocket de principio a fin."""
+        if self.client:
+            await websocket.close(code=1000, reason="Server is busy")
+            print("[WS] Conexión rechazada: otro cliente activo")
+            return
+
+        self.client = websocket
+        print("[WS] Cliente conectado")
+
+        try:
+            async for raw in websocket:
+                if isinstance(raw, str):
+                    raw = raw.encode()
+
+                # Asegura que termina en LF
+                if not raw.endswith(b"\n"):
+                    raw += b"\n"
+
+                # Asegura serial abierto
+                if not await self.ensure_serial():
+                    await websocket.send(b'{"error":"Serial port not connected"}')
+                    continue
+
+                # Ventana de emisión: espera hueco
+                while sum(self.pending) + len(raw) >= MAX_PENDING:
+                    await asyncio.sleep(0)
+
+                self.serial_write(raw)
+                if raw.strip():
+                    print(f"-> GRBL: {raw.decode(errors='replace').strip()}")
+
+        except websockets.exceptions.ConnectionClosedOK:
+            pass
+        except Exception as e:
+            print(f"[WS] Error: {e}")
+        finally:
+            print("[WS] Cliente desconectado")
+            self.client = None
+            # Vacía la cola pendiente por seguridad
+            self.pending.clear()
+
+    # ---------- Lector de GRBL ----------
+    async def serial_reader(self) -> None:
+        """Lee continuamente del puerto serie y reenvía al WebSocket."""
+        while True:
+            if not await self.ensure_serial():
+                await asyncio.sleep(RETRY_INTERVAL)
+                continue
+
             try:
-                state["waiting_for_ok"].clear()
-                state["serial_port"].write(cmd)
-                print(f"-> GRBL: {cmd.decode('utf-8').strip()}")
-                await state["waiting_for_ok"].wait()
-            except Exception as e:
-                print(f"Serial write error: {e}")
-        else:
-            print("Serial port not ready, skipping command")
+                # Lee todo lo disponible
+                in_waiting = self.serial.in_waiting
+                if in_waiting:
+                    self.recv_buf += self.serial.read(in_waiting)
 
-async def read_from_serial():
-    while True:
-        if state["serial_port"] and state["serial_port"].is_open:
-            try:
-                if state["serial_port"].in_waiting:
-                    line = state["serial_port"].readline()
-                    decoded = line.decode('utf-8', errors='replace').strip()
+                # Extrae líneas completas
+                while b"\n" in self.recv_buf:
+                    line, _, self.recv_buf = self.recv_buf.partition(b"\n")
+                    if not line:
+                        continue  # ignora líneas vacías
+
+                    decoded = line.decode(errors="replace")
                     print(f"<- GRBL: {decoded}")
 
-                    if state["active_client"]:
-                        await state["active_client"].send(line)
+                    # Control de flujo
+                    if line.startswith(b"ok") and self.pending:
+                        self.pending.popleft()
 
-                    if decoded == "ok":
-                        state["waiting_for_ok"].set()
+                    # Reenvía al cliente
+                    if self.client:
+                        with suppress(Exception):
+                            await self.client.send(line + b"\n")
 
             except Exception as e:
-                print(f"Serial read error: {e}")
-        await asyncio.sleep(0.01)
+                print(f"[SERIAL] Error de lectura: {e}")
+                with suppress(Exception):
+                    self.serial.close()
+                self.serial = None
 
-async def try_open_serial():
-    if state["serial_port"] and state["serial_port"].is_open:
-        return True
-    try:
-        state["serial_port"] = serial.Serial(
-            CONFIG["port"], CONFIG["baud_rate"], timeout=CONFIG["timeout"]
+            await asyncio.sleep(0)  # cede control inmediatamente
+
+    # ---------- Watchdog ----------
+    async def serial_watchdog(self) -> None:
+        while True:
+            if not await self.ensure_serial():
+                await asyncio.sleep(RETRY_INTERVAL)
+            else:
+                await asyncio.sleep(60)
+
+    # ---------- Servidor principal ----------
+    async def run(self) -> None:
+        await self.ensure_serial()
+
+        ws_server = await websockets.serve(
+            self.ws_handler,
+            host="0.0.0.0",
+            port=self.ws_port,
+            ping_interval=PING_SECONDS,
+            ping_timeout=PING_SECONDS * 2,
         )
-        print(f"Opened serial port: {CONFIG['port']}")
-        return True
-    except Exception as e:
-        print(f"Failed to open serial port: {e}")
-        state["serial_port"] = None
-        return False
 
-async def watchdog():
-    while True:
-        if not state["serial_port"] or not state["serial_port"].is_open:
-            await try_open_serial()
-        await asyncio.sleep(RETRY_INTERVAL)
+        ip = self.local_ip()
+        print(f"[INFO] WebSocket en ws://{ip}:{self.ws_port}")
+        print(f"[INFO] Pulsa Ctrl-C para salir\n")
 
-async def main():
-    if len(sys.argv) < 3:
-        print("Usage: server.py <serial> <ws_port>")
-        return
-
-    CONFIG["port"] = sys.argv[1]
-    CONFIG["ws_port"] = int(sys.argv[2])
-
-    await try_open_serial()
-
-    print(f"Server on ws://{get_local_ip()}:{CONFIG['ws_port']}")
-
-    async with websockets.serve(handle_websocket, "0.0.0.0", CONFIG["ws_port"]):
         await asyncio.gather(
-            read_from_serial(),
-            serial_writer(),
-            watchdog()
+            self.serial_reader(),
+            self.serial_watchdog(),
+            ws_server.wait_closed(),
         )
+
+
+# ---------- CLI ----------
+def parse_args() -> tuple[str, int]:
+    if len(sys.argv) != 3:
+        print(
+            "Uso:\n"
+            "  Windows: bridge.py <COMn> <puerto WS>\n"
+            "  Linux/Mac: bridge.py </dev/ttyUSB0> <puerto WS>"
+        )
+        sys.exit(1)
+
+    port_arg = sys.argv[1]
+    if platform.system() == "Windows" and port_arg.isdigit():
+        port_arg = "COM" + port_arg
+    elif not port_arg.startswith(("COM", "/dev/")):
+        port_arg = "/dev/tty" + port_arg  # fallback
+
+    return port_arg, int(sys.argv[2])
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    serial_port, ws_port = parse_args()
+    bridge = Bridge(serial_port, ws_port)
+    try:
+        asyncio.run(bridge.run())
+    except KeyboardInterrupt:
+        print("\n[INFO] Fin por Ctrl-C")
