@@ -11,7 +11,7 @@ state = {
     "command_queue": asyncio.Queue(),
     "waiting_ok": asyncio.Event()
 }
-state["waiting_ok"].set()  # Initially ready to send
+state["waiting_ok"].set()
 
 CONFIG = {
     "port": None,
